@@ -130,7 +130,8 @@ function extractFromListing(html) {
         const href = m[1];
         const block = innerText(m[2]);
         let name = block
-            .replace(/\b\d+\s*x\s*R\$\s*[\d\.,]+\b/gi, '') // remove “10x R$ …”
+            .replace(/\b\d+\s*x\s*R\$\s*[\d\.,]+\b/gi, '') // ex.: 10x R$ 15,99
+            .replace(/\b\d+\s*x\s*[\d\.,]+\b/gi, '')       // ex.: 10x 15,99 (sem R$)
             .replace(/\s+PROMO(ÇÃO)?!?\s*/gi, ' ')
             .split(/—|\|/)[0]
             .trim();
@@ -143,7 +144,6 @@ function extractFromListing(html) {
 
 // ===== Produto: tentar várias fontes e priorizar SALE =====
 function extractFromProductPage(html, url) {
-    // Nome
     const name =
         (/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i.exec(html)?.[1]) ||
         (/<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1]?.replace(/<[^>]+>/g, '').trim()) ||
@@ -152,22 +152,37 @@ function extractFromProductPage(html, url) {
     const saleCandidates = [];
     const generalCandidates = [];
 
-    // 1) JSON-LD (price / lowPrice / offers) — geralmente já traz o preço atual
+    // 2.1) JSON de produto (Shopify) — <script type="application/json" data-product-json>
+    const reProductJson = /<script[^>]+type=["']application\/json["'][^>]*data-product-json[^>]*>([\s\S]*?)<\/script>/gi;
+    let pj;
+    while ((pj = reProductJson.exec(html))) {
+        try {
+            const j = JSON.parse(pj[1].trim());
+            const variants = j?.product?.variants || j?.variants || [];
+            for (const v of variants) {
+                // preços vêm em centavos
+                if (typeof v.price === 'number') saleCandidates.push(v.price / 100);
+                if (typeof v.compare_at_price === 'number') generalCandidates.push(v.compare_at_price / 100);
+            }
+        } catch {}
+    }
+
+    // 2.2) JSON-LD (offers/lowPrice/price/highPrice)
     const jsonldRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
     let jm;
     while ((jm = jsonldRe.exec(html))) {
-        const raw = jm[1];
         try {
-            const parsed = JSON.parse(raw.trim());
+            const parsed = JSON.parse(jm[1].trim());
             const nodes = Array.isArray(parsed) ? parsed : [parsed];
             for (const n of nodes) collectOfferPrices(n, saleCandidates, generalCandidates);
         } catch {}
     }
 
-    // 2) Classes de SALE típicas do Shopify (permite tags internas)
+    // 2.3) Classes comuns de SALE/regular (temas Shopify variados)
     for (const re of [
         /price-item--sale[\s\S]{0,200}?R\$\s*([\d\.\,]+)/gi,
-        /price--on-sale[\s\S]{0,400}?R\$\s*([\d\.\,]+)/gi
+        /price--on-sale[\s\S]{0,400}?R\$\s*([\d\.\,]+)/gi,
+        /price__sale[\s\S]{0,400}?R\$\s*([\d\.\,]+)/gi,
     ]) {
         let m;
         while ((m = re.exec(html))) {
@@ -176,7 +191,7 @@ function extractFromProductPage(html, url) {
         }
     }
 
-    // 3) Metatags OG/Product (algumas lojas colocam o preço **atual** aqui; outras colocam o cheio)
+    // 2.4) Metatags OG/Product
     for (const re of [
         /<meta[^>]+property=["']og:price:amount["'][^>]+content=["']([\d\.,]+)["']/i,
         /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([\d\.,]+)["']/i,
@@ -188,7 +203,7 @@ function extractFromProductPage(html, url) {
         }
     }
 
-    // 4) Fallback de texto: captura "R$ xx,xx" ignorando parcelas
+    // 2.5) Fallback de texto — pega "R$ xx,xx" e ignora parcelas
     const text = innerText(html);
     const reBrl = /R\$\s*([\d\.]{1,3}(?:\.\d{3})*,\d{2})/gi;
     let pm;
@@ -200,8 +215,7 @@ function extractFromProductPage(html, url) {
         if (val) generalCandidates.push(val);
     }
 
-    // Escolha: se houver candidatos de SALE, use o MENOR deles (preço com desconto).
-    // Senão, use o MENOR entre os candidatos gerais.
+    // Escolha final
     let priceNum = null;
     if (saleCandidates.length) priceNum = Math.min(...saleCandidates);
     else if (generalCandidates.length) priceNum = Math.min(...generalCandidates);
@@ -210,27 +224,21 @@ function extractFromProductPage(html, url) {
     return { name, price, priceNum, url };
 }
 
+// coleta preços de offers JSON-LD; lowPrice vai para 'sale'
 function collectOfferPrices(obj, saleOut, generalOut) {
     if (!obj || typeof obj !== 'object') return;
 
-    // Product → offers
     if (obj.offers) {
         const offers = Array.isArray(obj.offers) ? obj.offers : [obj.offers];
         for (const ofr of offers) collectOfferPrices(ofr, saleOut, generalOut);
     }
 
-    // Offer / AggregateOffer
     const nums = [];
-    if (obj.price != null) nums.push(Number(String(obj.price).replace(',', '.')));
-    if (obj.lowPrice != null) nums.push(Number(String(obj.lowPrice).replace(',', '.'))); // geralmente o sale
-    if (obj.highPrice != null) nums.push(Number(String(obj.highPrice).replace(',', '.')));
-    for (const v of nums) {
-        if (Number.isFinite(v)) {
-            // Heurística: lowPrice vai para "saleOut"; price/highPrice vão para "generalOut"
-            if (obj.lowPrice != null && v === Number(String(obj.lowPrice).replace(',', '.'))) saleOut.push(v);
-            else generalOut.push(v);
-        }
-    }
+    if (obj.price != null) nums.push({ v: Number(String(obj.price).replace(',', '.')), sale: false });
+    if (obj.lowPrice != null) nums.push({ v: Number(String(obj.lowPrice).replace(',', '.')), sale: true });
+    if (obj.highPrice != null) nums.push({ v: Number(String(obj.highPrice).replace(',', '.')), sale: false });
+
+    for (const e of nums) if (Number.isFinite(e.v)) (e.sale ? saleOut : generalOut).push(e.v);
 
     for (const k in obj) {
         const v = obj[k];
@@ -298,17 +306,13 @@ function findMatches(question, catalog) {
 function makeDeterministicAnswer(question, matches) {
     if (!matches.length) return 'Não achei esse item agora no catálogo público da diRavena.';
 
-    // Intenções (agora com /i)
     const asksPrice     = /quanto|preco|preço|custa|valor/i.test(question);
     const wantsCheapest = /mais\s*barat|minim|menor\s*pre[cç]o/i.test(question) || asksPrice;
     const wantsMostExp  = /mais\s*cara|mais\s*caro|maior\s*pre[cç]o|mais\s*caras/i.test(question);
 
     let pick = matches[0];
-    if (wantsMostExp) {
-        pick = matches.reduce((a,b) => (a.priceValue > b.priceValue ? a : b));
-    } else if (wantsCheapest) {
-        pick = matches.reduce((a,b) => (a.priceValue < b.priceValue ? a : b));
-    }
+    if (wantsMostExp)  pick = matches.reduce((a,b) => (a.priceValue > b.priceValue ? a : b));
+    else if (wantsCheapest) pick = matches.reduce((a,b) => (a.priceValue < b.priceValue ? a : b));
 
     if (wantsMostExp || wantsCheapest || asksPrice) {
         return [
@@ -318,7 +322,6 @@ function makeDeterministicAnswer(question, matches) {
         ].join('\n');
     }
 
-    // Texto padrão sem contagem
     return [
         'Encontrei essas opções:',
         ...matches.slice(0,3).map(m => `${m.name} — ${m.price}\n${m.url}`)
