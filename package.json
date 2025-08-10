@@ -1,12 +1,10 @@
 {
   "name": "starmindai",
-  "version": "1.0.0",
-  "main": "index.js",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": ""
+    "dev": "node api/index.js",
+    "vercel:dev": "vercel dev"
+  }
 }

@@ -1,13 +1,13 @@
 // api/index.js
-// Runtime: Node 18+ (Vercel Serverless Function, arquivo único)
+// Node 18+ (ESM). Exporta um handler serverless.
+// Opcionalmente reescreve a resposta com OpenAI, mas SEM inventar nada.
 
-// Opcional: reescrita "mais natural" com IA usando os dados raspados
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
-// Cache em memória entre invocações
+// Cache em memória (sobrevive entre invocações em serverless)
 let CACHE = { products: [], lastScrape: 0 };
 
-// URLs alvo (páginas públicas)
+// Páginas públicas para raspagem
 const BASE = 'https://diravena.com';
 const LISTING_URLS = [
     `${BASE}/`,
@@ -17,7 +17,7 @@ const LISTING_URLS = [
 ];
 
 export default async function handler(req, res) {
-    // CORS básico para permitir servir o front estático
+    // CORS básico
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'content-type,authorization');
@@ -43,22 +43,18 @@ export default async function handler(req, res) {
             await ensureCatalog(false);
             const matches = findMatches(question, CACHE.products);
 
-            // Resposta "determinística": usa apenas os dados encontrados
+            // Resposta curta/determinística (sem IA)
             const baseline = makeDeterministicAnswer(question, matches);
 
-            // Se houver chave OpenAI, pedir para reescrever de forma mais natural SEM adicionar nada
+            // Opcional: reescrever com IA (sem adicionar fatos)
             let answer = baseline;
             if (OPENAI_API_KEY && matches.length) {
-                try {
-                    answer = await llmRewrite(baseline, question, matches);
-                } catch {
-                    // Falhou? segue com baseline
-                }
+                try { answer = await llmRewrite(baseline, question); } catch {}
             }
 
             return json(res, {
                 answer,
-                matches,              // Top itens usados como base
+                matches,              // base factual usada (para debug/telemetria)
                 updatedAt: CACHE.lastScrape,
             });
         }
@@ -71,7 +67,7 @@ export default async function handler(req, res) {
     }
 }
 
-/* -------------------- Coleta e parsing -------------------- */
+/* ========================= Coleta e parsing ========================= */
 
 async function ensureCatalog(force = false) {
     const MAX_AGE_MS = 60 * 60 * 1000; // 1h
@@ -79,38 +75,48 @@ async function ensureCatalog(force = false) {
     if (!force && CACHE.products.length && !stale) return;
 
     const found = new Map(); // url -> {name, price, url}
+
+    // 1) Coleta links/nome das listagens
     for (const url of LISTING_URLS) {
         try {
             const html = await fetchText(url);
-            const fromList = extractFromListing(html, url);
+            const fromList = extractFromListing(html);
             for (const p of fromList) found.set(p.url, p);
         } catch (e) {
             console.warn('Falha ao ler listagem', url, e?.message);
         }
     }
 
-    // Preenche preços que faltaram, consultando página do produto (limite para não estourar tempo)
-    const needDetails = [...found.values()].filter(p => !p.price).slice(0, 15);
-    await Promise.all(
-        needDetails.map(async (p) => {
-            try {
-                const html = await fetchText(p.url);
-                const det = extractFromProductPage(html, p.url);
-                if (det?.price) p.price = det.price;
-                if (det?.name) p.name = det.name;
-            } catch {}
-        })
-    );
+    // 2) Completa com preço CONFIÁVEL pegando a página do produto (metatags)
+    const urls = [...found.values()].map(p => p.url);
+    const limit = 6; // concorrência
+    for (let i = 0; i < urls.length; i += limit) {
+        await Promise.all(
+            urls.slice(i, i + limit).map(async (u) => {
+                try {
+                    const html = await fetchText(u);
+                    const det = extractFromProductPage(html, u);
+                    const base = found.get(u);
+                    if (det?.name) base.name = det.name;
+                    if (det?.price) base.price = det.price;
+                } catch {}
+            })
+        );
+    }
 
     CACHE.products = [...found.values()]
         .filter(p => p.name && p.price)
-        .map(p => ({ ...p, priceValue: parsePrice(p.price), normName: normalize(p.name) }));
+        .map(p => ({
+            ...p,
+            priceValue: toNumberBRL(p.price.replace('R$','').trim()),
+            normName: normalize(p.name),
+        }));
     CACHE.lastScrape = Date.now();
 }
 
 async function fetchText(url) {
     const r = await fetch(url, {
-        headers: { 'user-agent': 'Mozilla/5.0; ChatBot/1.0 (+vercel)' },
+        headers: { 'user-agent': 'Mozilla/5.0; StarmindBot/1.0' },
     });
     if (!r.ok) throw new Error(`HTTP ${r.status} ao baixar ${url}`);
     return await r.text();
@@ -125,67 +131,62 @@ function innerText(html) {
         .trim();
 }
 
-// Extrai itens de uma listagem (cards com link para /products/...)
-function extractFromListing(html, pageUrl) {
+/* -------- Listagem: obtém nome+link (preço vem da página do produto) -------- */
+function extractFromListing(html) {
     const out = [];
     const reA = /<a\s+[^>]*href="(\/products\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
     let m;
     while ((m = reA.exec(html))) {
         const href = m[1];
         const block = innerText(m[2]);
-        // Tentativa 1: nome " — Preço promocional R$ X"
-        let priceMatch = /Preço\s+promocional\s*R\$\s*([\d\.,]+)/i.exec(block);
-        let name = null;
-        let price = null;
-
-        if (priceMatch) {
-            price = `R$ ${priceMatch[1]}`;
-            // nome é o texto antes do "— Preço promocional"
-            const idx = block.toLowerCase().lastIndexOf('preço promocional');
-            if (idx > 0) {
-                const before = block.slice(0, idx);
-                // corta no travessão mais próximo se existir
-                const dashIdx = before.lastIndexOf('—');
-                name = (dashIdx >= 0 ? before.slice(0, dashIdx) : before).trim();
-            }
-        }
-
-        // Se ainda sem nome, usa heurísticas: maior trecho de palavras no bloco
-        if (!name) {
-            const parts = block.split(/—|\|/).map(s => s.trim()).filter(Boolean);
-            if (parts.length) name = parts[0];
-        }
-
-        // Monta URL absoluta
+        let name = block
+            .replace(/\b\d+\s*x\s*R\$\s*[\d\.,]+\b/gi, '') // remove “10x R$ …”
+            .replace(/\s+PROMO(ÇÃO)?!?\s*/gi, ' ')
+            .split(/—|\|/)[0]
+            .trim();
+        if (!name) continue;
         const url = new URL(href, BASE).toString();
-        if (name) out.push({ name, price, url });
+        out.push({ name, price: null, url });
     }
     return out;
 }
 
-// Extrai dados da página de produto
+/* -------- Produto: pega preço por metatag (og:price/product:price), fallback robusto -------- */
 function extractFromProductPage(html, url) {
-    const text = innerText(html);
-    const name = (/<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1] || '').replace(/<[^>]+>/g, '').trim()
-        || (/^#\s*(.+)$/m.exec(text)?.[1] || '').trim()
-        || null;
-    const price = (/Preço\s+promocional\s*R\$\s*([\d\.,]+)/i.exec(text)?.[1])
-        ? `R$ ${/Preço\s+promocional\s*R\$\s*([\d\.,]+)/i.exec(text)[1]}`
-        : null;
+    // Nome
+    const name =
+        (/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i.exec(html)?.[1]) ||
+        (/<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1]?.replace(/<[^>]+>/g, '').trim()) ||
+        null;
 
+    // 1) Meta
+    let priceNum = null;
+    let m =
+        /<meta[^>]+property="og:price:amount"[^>]+content="([\d\.]+)"/i.exec(html) ||
+        /<meta[^>]+property="product:price:amount"[^>]+content="([\d\.]+)"/i.exec(html);
+    if (m) priceNum = Number(m[1]);
+
+    // 2) Fallback: captura "R$ xx,xx" ignorando parcelas ("10x R$ …")
+    if (!priceNum) {
+        const text = innerText(html);
+        const candidates = [];
+        const re = /R\$\s*([\d\.]{1,3}(?:\.\d{3})*,\d{2})/gi;
+        let pm;
+        while ((pm = re.exec(text))) {
+            const before = text.slice(Math.max(0, pm.index - 8), pm.index).toLowerCase();
+            const isInstallment = /\b\d+\s*x\s*$/i.test(before) || /\b\d+x\s*$/i.test(before);
+            if (isInstallment) continue; // ignora “10x R$…”
+            const val = toNumberBRL(pm[1]);
+            if (val) candidates.push(val);
+        }
+        if (candidates.length) priceNum = Math.max(...candidates); // tende a ser o preço cheio
+    }
+
+    const price = priceNum ? fromNumberToBRL(priceNum) : null;
     return { name, price, url };
 }
 
-function parsePrice(brl) {
-    // "R$ 139,90" -> 139.90 (number)
-    const m = /([\d\.,]+)/.exec(brl || '');
-    if (!m) return null;
-    const n = m[1].replace(/\./g, '').replace(',', '.');
-    const v = Number(n);
-    return Number.isFinite(v) ? v : null;
-}
-
-/* -------------------- Busca e resposta -------------------- */
+/* ========================= Busca e resposta ========================= */
 
 function normalize(s) {
     return (s || '')
@@ -196,91 +197,94 @@ function normalize(s) {
         .trim();
 }
 
-const PT_STOP = new Set(['o','a','os','as','um','uma','de','da','do','das','dos','que','qual',
-    'quais','quanto','quanta','cust','custa','custam','preco','preço','tem','e']);
+const PT_STOP = new Set([
+    'o','a','os','as','um','uma','de','da','do','das','dos','que','qual','quais','quanto','quanta',
+    'cust','custa','custam','preco','preço','tem','e','ou'
+]);
+
+const HARD_FILTERS = ['sapatenis','mocatenis','mocassim','bota','sandalia','tenis'];
+const SYN = new Map([
+    ['sapatenis','sapatennis'],
+    ['mocatenis','mocatennis'],
+]);
 
 function findMatches(question, catalog) {
     const qn = normalize(question);
     const toks = qn.split(' ').filter(t => t && !PT_STOP.has(t));
     if (!toks.length) return [];
-
-    const synonyms = new Map([
-        ['sapatenis','sapatennis'], // variações
-        ['mocatenis','mocatennis'],
-    ]);
+    const hard = HARD_FILTERS.find(h => qn.includes(h));
 
     function score(p) {
         let s = 0;
         for (const t of toks) {
-            const t2 = synonyms.get(t) || t;
+            const t2 = SYN.get(t) || t;
             if (p.normName.includes(t)) s += 2;
             if (t2 !== t && p.normName.includes(t2)) s += 1;
-        }
-        // bônus por tokens "produto"
-        if (/\b(sapatenis|mocatenis|mocassim|bota|sandalia|babydoll)\b/.test(qn)) {
-            if (/\b(sapatenis|mocatenis|mocassim|bota|sandalia|babydoll)\b/.test(p.normName)) s += 1;
         }
         return s;
     }
 
-    const ranked = catalog.map(p => ({ ...p, _score: score(p) }))
-        .filter(p => p._score > 0)
-        .sort((a,b) => b._score - a._score || (a.priceValue ?? 1e9) - (b.priceValue ?? 1e9));
+    let ranked = catalog
+        .map(p => ({ ...p, _score: score(p) }))
+        .filter(p => p._score > 0);
+
+    // Se citou categoria, aplica filtro duro
+    if (hard) {
+        ranked = ranked.filter(p => {
+            const alt = SYN.get(hard) || hard;
+            return p.normName.includes(hard) || p.normName.includes(alt);
+        });
+    }
+
+    ranked.sort((a,b) => b._score - a._score || (a.priceValue ?? 1e9) - (b.priceValue ?? 1e9));
     return ranked.slice(0, 5).map(({_score, normName, priceValue, ...rest}) => rest);
 }
 
 function makeDeterministicAnswer(question, matches) {
-    if (!matches.length) {
-        return 'Não encontrei esse item no catálogo público da diRavena agora. Tente outro termo ou peça para atualizar a busca.';
-    }
-    // Se a pergunta sugere "quanto custa", foque no preço
+    if (!matches.length) return 'Não achei esse item no catálogo público da diRavena agora.';
+
     const asksPrice = /quanto|preco|preço|custa|custam/i.test(question);
+    const cheapest = matches.reduce((a,b) => (a.priceValue < b.priceValue ? a : b));
+
     if (asksPrice) {
-        if (matches.length === 1) {
-            const m = matches[0];
-            return `O preço atual é ${m.price} para “${m.name}”. Link: ${m.url}`;
-        } else {
-            const min = matches.reduce((a,b) => (a.priceValue < b.priceValue ? a : b));
-            const examples = matches.slice(0,3).map(m => `• ${m.name} — ${m.price}`).join('\n');
-            return `Encontrei ${matches.length} opções. O menor preço entre elas é ${min.price}.\n${examples}\nLinks:\n${matches.slice(0,3).map(m=>`- ${m.url}`).join('\n')}`;
-        }
+        // Resposta curta e direta
+        return [
+            'Encontrei algumas opções. A mais barata é:',
+            `${cheapest.name} — ${cheapest.price}`,
+            cheapest.url
+        ].join('\n');
     }
-    // Outra pergunta: apenas listar correspondências
-    return `Encontrei ${matches.length} item(ns) que combinam:\n${matches.slice(0,3).map(m => `• ${m.name} — ${m.price}\n  ${m.url}`).join('\n')}`;
+
+    return [
+        `Encontrei ${matches.length} opções (mostrando até 3):`,
+        ...matches.slice(0,3).map(m => `${m.name} — ${m.price}\n${m.url}`)
+    ].join('\n');
 }
 
-/* -------------------- IA opcional para reescrever -------------------- */
+/* ========================= IA opcional (rephrase) ========================= */
 
-async function llmRewrite(baseline, question, matches) {
-    const content = [
-        `PERGUNTA: ${question}`,
-        `RESPOSTA_BASE (não invente nada além disso):`,
-        baseline,
-    ].join('\n\n');
-
+async function llmRewrite(baseline, question) {
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
-            'authorization': `Bearer ${OPENAI_API_KEY}`,
+            authorization: `Bearer ${OPENAI_API_KEY}`,
             'content-type': 'application/json',
         },
         body: JSON.stringify({
             model: 'gpt-4o-mini',
             temperature: 0.2,
             messages: [
-                { role: 'system', content: 'Você responde em PT-BR apenas com o conteúdo fornecido. Não invente nada. Seja direto.' },
-                { role: 'user', content },
+                { role: 'system', content: 'Responda em PT-BR, de forma curta e só com o conteúdo fornecido. Não invente.' },
+                { role: 'user', content: `PERGUNTA: ${question}\n\nRESPOSTA_BASE:\n${baseline}` },
             ],
         }),
     });
-
     if (!r.ok) throw new Error(`OpenAI HTTP ${r.status}`);
     const j = await r.json();
-    const out = j?.choices?.[0]?.message?.content?.trim();
-    return out || baseline;
+    return j?.choices?.[0]?.message?.content?.trim() || baseline;
 }
 
-/* -------------------- util -------------------- */
+/* ========================= Utils ========================= */
 
 function json(res, obj, status=200) {
     res.statusCode = status;
@@ -296,5 +300,35 @@ function readJson(req) {
             try { resolve(JSON.parse(data || '{}')); }
             catch { resolve({}); }
         });
+    });
+}
+
+function toNumberBRL(s) {
+    if (!s) return null;
+    const n = String(s).replace(/\./g, '').replace(',', '.');
+    const v = Number(n);
+    return Number.isFinite(v) ? v : null;
+}
+function fromNumberToBRL(v) {
+    return 'R$ ' + v.toFixed(2).replace('.', ',');
+}
+
+/* ========================= Dev server local (opcional) =========================
+   Execute: node api/index.js
+   Em produção (Vercel) esse bloco é ignorado.
+--------------------------------------------------------------------------- */
+if (import.meta.url === `file://${process.argv[1]}`) {
+    const http = await import('http');
+    const PORT = process.env.PORT || 3001;
+    const server = http.createServer((req, res) => {
+        const url = new URL(req.url, `http://localhost:${PORT}`);
+        if (url.pathname === '/' || url.pathname === '/api/index') {
+            return handler(req, res);
+        }
+        res.statusCode = 404;
+        res.end('Not found');
+    });
+    server.listen(PORT, () => {
+        console.log(`Dev server ON em http://localhost:${PORT} (rota /api/index)`);
     });
 }
