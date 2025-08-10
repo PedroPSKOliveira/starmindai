@@ -1,11 +1,10 @@
 // api/index.js
 // Node 18+ (ESM). Handler serverless para Vercel.
-// Extrai catálogo do site e responde perguntas objetivas.
-// Agora prioriza PREÇO COM DESCONTO (sale) e entende "mais barato/mais caro".
+// Busca catálogo no site e responde perguntas. Prioriza SEMPRE o preço COM DESCONTO.
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
-// Cache simples em memória
+// Cache em memória
 let CACHE = { products: [], lastScrape: 0 };
 
 const BASE = 'https://diravena.com';
@@ -68,7 +67,7 @@ async function ensureCatalog(force = false) {
 
     const found = new Map();
 
-    // 1) Listagens (nome + URL). O preço virá da página do produto.
+    // 1) Listagens: nome + URL
     for (const url of LISTING_URLS) {
         try {
             const html = await fetchText(url);
@@ -80,7 +79,7 @@ async function ensureCatalog(force = false) {
         }
     }
 
-    // 2) Páginas de produto — busca **preço com desconto** (JSON-LD / meta / fallback)
+    // 2) Páginas de produto: extrai PREÇO COM DESCONTO quando existir
     const urls = [...found.values()].map(p => p.url);
     const limit = 6;
     for (let i = 0; i < urls.length; i += limit) {
@@ -91,8 +90,8 @@ async function ensureCatalog(force = false) {
                     const det = extractFromProductPage(html, u);
                     const base = found.get(u);
                     if (det?.name) base.name = det.name;
-                    if (det?.price) base.price = det.price;            // BRL string (já com desconto)
-                    if (det?.priceNum) base.priceValue = det.priceNum; // número (já com desconto)
+                    if (det?.price) base.price = det.price;
+                    if (det?.priceNum != null) base.priceValue = det.priceNum;
                 } catch {}
             })
         );
@@ -110,7 +109,7 @@ async function ensureCatalog(force = false) {
 }
 
 async function fetchText(url) {
-    const r = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0; StarmindBot/1.1' }});
+    const r = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0; StarmindBot/1.2' }});
     if (!r.ok) throw new Error(`HTTP ${r.status} ao baixar ${url}`);
     return await r.text();
 }
@@ -142,7 +141,7 @@ function extractFromListing(html) {
     return out;
 }
 
-// ===== Produto: prioriza preço de SALE (desconto) =====
+// ===== Produto: tentar várias fontes e priorizar SALE =====
 function extractFromProductPage(html, url) {
     // Nome
     const name =
@@ -150,8 +149,10 @@ function extractFromProductPage(html, url) {
         (/<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1]?.replace(/<[^>]+>/g, '').trim()) ||
         null;
 
-    // 1) JSON-LD (sempre tenta primeiro; pega menor preço => sale)
-    const jsonldPrices = [];
+    const saleCandidates = [];
+    const generalCandidates = [];
+
+    // 1) JSON-LD (price / lowPrice / offers) — geralmente já traz o preço atual
     const jsonldRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
     let jm;
     while ((jm = jsonldRe.exec(html))) {
@@ -159,12 +160,23 @@ function extractFromProductPage(html, url) {
         try {
             const parsed = JSON.parse(raw.trim());
             const nodes = Array.isArray(parsed) ? parsed : [parsed];
-            for (const n of nodes) collectOfferPrices(n, jsonldPrices);
+            for (const n of nodes) collectOfferPrices(n, saleCandidates, generalCandidates);
         } catch {}
     }
 
-    // 2) Metatags OG/Product (adiciona às candidatas; muitas lojas usam o preço atual aqui)
-    const metaPrices = [];
+    // 2) Classes de SALE típicas do Shopify (permite tags internas)
+    for (const re of [
+        /price-item--sale[\s\S]{0,200}?R\$\s*([\d\.\,]+)/gi,
+        /price--on-sale[\s\S]{0,400}?R\$\s*([\d\.\,]+)/gi
+    ]) {
+        let m;
+        while ((m = re.exec(html))) {
+            const val = toNumberBRL(m[1]);
+            if (val) saleCandidates.push(val);
+        }
+    }
+
+    // 3) Metatags OG/Product (algumas lojas colocam o preço **atual** aqui; outras colocam o cheio)
     for (const re of [
         /<meta[^>]+property=["']og:price:amount["'][^>]+content=["']([\d\.,]+)["']/i,
         /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([\d\.,]+)["']/i,
@@ -172,67 +184,57 @@ function extractFromProductPage(html, url) {
         const mm = re.exec(html);
         if (mm) {
             const v = Number(String(mm[1]).replace(',', '.'));
-            if (Number.isFinite(v)) metaPrices.push(v);
+            if (Number.isFinite(v)) generalCandidates.push(v);
         }
     }
 
-    // 3) Fallback robusto no texto: captura "R$ xx,xx" e ignora parcelas (10x R$…)
+    // 4) Fallback de texto: captura "R$ xx,xx" ignorando parcelas
     const text = innerText(html);
-    const textPrices = [];
     const reBrl = /R\$\s*([\d\.]{1,3}(?:\.\d{3})*,\d{2})/gi;
     let pm;
     while ((pm = reBrl.exec(text))) {
         const before = text.slice(Math.max(0, pm.index - 8), pm.index).toLowerCase();
         const isInstallment = /\b\d+\s*x\s*$/i.test(before) || /\b\d+x\s*$/i.test(before);
-        if (isInstallment) continue; // ignora “10x R$…”
+        if (isInstallment) continue;
         const val = toNumberBRL(pm[1]);
-        if (val) textPrices.push(val);
+        if (val) generalCandidates.push(val);
     }
 
-    // 4) Hint por classe: price-item--sale (Shopify) → garante pegar o sale quando existir
-    const saleClassPrices = [];
-    const reSale = /price-item--sale[^>]*>\s*R\$\s*([\d\.]{1,3}(?:\.\d{3})*,\d{2})/gi;
-    let sm;
-    while ((sm = reSale.exec(html))) {
-        const val = toNumberBRL(sm[1]);
-        if (val) saleClassPrices.push(val);
-    }
+    // Escolha: se houver candidatos de SALE, use o MENOR deles (preço com desconto).
+    // Senão, use o MENOR entre os candidatos gerais.
+    let priceNum = null;
+    if (saleCandidates.length) priceNum = Math.min(...saleCandidates);
+    else if (generalCandidates.length) priceNum = Math.min(...generalCandidates);
 
-    // Consolida: se houver "sale" explícito, use o MENOR; senão, use o menor entre JSON-LD/meta/text.
-    const candidates = [
-        ...saleClassPrices,
-        ...jsonldPrices,
-        ...metaPrices,
-        ...textPrices
-    ];
-    const priceNum = candidates.length ? Math.min(...candidates) : null; // menor = preço com desconto
     const price = priceNum ? fromNumberToBRL(priceNum) : null;
-
     return { name, price, priceNum, url };
 }
 
-function collectOfferPrices(obj, out) {
+function collectOfferPrices(obj, saleOut, generalOut) {
     if (!obj || typeof obj !== 'object') return;
 
-    // "Product" com "offers"
+    // Product → offers
     if (obj.offers) {
         const offers = Array.isArray(obj.offers) ? obj.offers : [obj.offers];
-        for (const ofr of offers) collectOfferPrices(ofr, out);
+        for (const ofr of offers) collectOfferPrices(ofr, saleOut, generalOut);
     }
 
     // Offer / AggregateOffer
-    if (obj['@type'] === 'Offer' || obj['@type'] === 'AggregateOffer' || ('price' in obj) || ('lowPrice' in obj) || ('highPrice' in obj)) {
-        const vals = [];
-        if (obj.price != null) vals.push(Number(String(obj.price).replace(',', '.')));
-        if (obj.lowPrice != null) vals.push(Number(String(obj.lowPrice).replace(',', '.')));   // preço com desconto costuma estar aqui
-        if (obj.highPrice != null) vals.push(Number(String(obj.highPrice).replace(',', '.')));
-        for (const v of vals) if (Number.isFinite(v)) out.push(v);
+    const nums = [];
+    if (obj.price != null) nums.push(Number(String(obj.price).replace(',', '.')));
+    if (obj.lowPrice != null) nums.push(Number(String(obj.lowPrice).replace(',', '.'))); // geralmente o sale
+    if (obj.highPrice != null) nums.push(Number(String(obj.highPrice).replace(',', '.')));
+    for (const v of nums) {
+        if (Number.isFinite(v)) {
+            // Heurística: lowPrice vai para "saleOut"; price/highPrice vão para "generalOut"
+            if (obj.lowPrice != null && v === Number(String(obj.lowPrice).replace(',', '.'))) saleOut.push(v);
+            else generalOut.push(v);
+        }
     }
 
-    // Varre propriedades aninhadas
     for (const k in obj) {
         const v = obj[k];
-        if (v && typeof v === 'object') collectOfferPrices(v, out);
+        if (v && typeof v === 'object') collectOfferPrices(v, saleOut, generalOut);
     }
 }
 
@@ -249,10 +251,9 @@ function normalize(s) {
 
 const PT_STOP = new Set([
     'o','a','os','as','um','uma','de','da','do','das','dos','que','qual','quais',
-    'quanto','quanta','preco','preço','custa','custam','tem','e','ou','mais','qual'
+    'quanto','quanta','preco','preço','custa','valor','tem','e','ou','mais','qual'
 ]);
 
-// Inclui vestuário para hard filter
 const HARD_FILTERS = [
     'sapatenis','mocatenis','mocassim','bota','sandalia','tenis',
     'camiseta','camisa','polo','regata','bermuda','calca'
@@ -290,7 +291,6 @@ function findMatches(question, catalog) {
         });
     }
 
-    // ordena por relevância e depois por preço (asc)
     ranked.sort((a,b) => b._score - a._score || a.priceValue - b.priceValue);
     return ranked.slice(0, 8).map(({_score, normName, ...rest}) => rest);
 }
@@ -298,10 +298,10 @@ function findMatches(question, catalog) {
 function makeDeterministicAnswer(question, matches) {
     if (!matches.length) return 'Não achei esse item agora no catálogo público da diRavena.';
 
-    // Intenções
-    const asksPrice = /quanto|preco|preço|custa|valor/i.test(question);
-    const wantsCheapest = /mais\s*barat|minim|menor\s*pre[cç]o/.test(question) || asksPrice;
-    const wantsMostExp = /mais\s*cara|mais\s*caro|maior\s*pre[cç]o|mais\s*caras/.test(question);
+    // Intenções (agora com /i)
+    const asksPrice     = /quanto|preco|preço|custa|valor/i.test(question);
+    const wantsCheapest = /mais\s*barat|minim|menor\s*pre[cç]o/i.test(question) || asksPrice;
+    const wantsMostExp  = /mais\s*cara|mais\s*caro|maior\s*pre[cç]o|mais\s*caras/i.test(question);
 
     let pick = matches[0];
     if (wantsMostExp) {
@@ -310,7 +310,6 @@ function makeDeterministicAnswer(question, matches) {
         pick = matches.reduce((a,b) => (a.priceValue < b.priceValue ? a : b));
     }
 
-    // Resposta curta e direta (sem parênteses extras)
     if (wantsMostExp || wantsCheapest || asksPrice) {
         return [
             'Encontrei algumas opções. A mais barata é:',
@@ -319,8 +318,9 @@ function makeDeterministicAnswer(question, matches) {
         ].join('\n');
     }
 
+    // Texto padrão sem contagem
     return [
-        `Encontrei ${matches.length} opções:`,
+        'Encontrei essas opções:',
         ...matches.slice(0,3).map(m => `${m.name} — ${m.price}\n${m.url}`)
     ].join('\n');
 }
