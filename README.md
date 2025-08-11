@@ -19,4 +19,4 @@ Chatbot (React + Node/Vercel) que lê o site da diRavena e responde perguntas ob
 
 
 ## Demonstração
-![Demo](https://starmindai-gd4h6dmwm-pedropskoliveiras-projects.vercel.app/)
+![Demo](https://starmindai-c3rlkvt57-pedropskoliveiras-projects.vercel.app/)
