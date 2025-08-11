@@ -1,10 +1,5 @@
-// api/index.js
-// Node 18+ (ESM). Handler serverless para Vercel.
-// Busca catálogo no site e responde perguntas. Prioriza SEMPRE o preço COM DESCONTO.
-
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
-// Cache em memória
 let CACHE = { products: [], lastScrape: 0 };
 
 const BASE = 'https://diravena.com';
@@ -79,7 +74,6 @@ async function ensureCatalog(force = false) {
         }
     }
 
-    // 2) Páginas de produto: extrai PREÇO COM DESCONTO quando existir
     const urls = [...found.values()].map(p => p.url);
     const limit = 6;
     for (let i = 0; i < urls.length; i += limit) {
@@ -142,7 +136,6 @@ function extractFromListing(html) {
     return out;
 }
 
-// ===== Produto: tentar várias fontes e priorizar SALE =====
 function extractFromProductPage(html, url) {
     const name =
         (/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i.exec(html)?.[1]) ||
@@ -152,7 +145,6 @@ function extractFromProductPage(html, url) {
     const saleCandidates = [];
     const generalCandidates = [];
 
-    // 2.1) JSON de produto (Shopify) — <script type="application/json" data-product-json>
     const reProductJson = /<script[^>]+type=["']application\/json["'][^>]*data-product-json[^>]*>([\s\S]*?)<\/script>/gi;
     let pj;
     while ((pj = reProductJson.exec(html))) {
@@ -167,7 +159,6 @@ function extractFromProductPage(html, url) {
         } catch {}
     }
 
-    // 2.2) JSON-LD (offers/lowPrice/price/highPrice)
     const jsonldRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
     let jm;
     while ((jm = jsonldRe.exec(html))) {
@@ -178,7 +169,6 @@ function extractFromProductPage(html, url) {
         } catch {}
     }
 
-    // 2.3) Classes comuns de SALE/regular (temas Shopify variados)
     for (const re of [
         /price-item--sale[\s\S]{0,200}?R\$\s*([\d\.\,]+)/gi,
         /price--on-sale[\s\S]{0,400}?R\$\s*([\d\.\,]+)/gi,
@@ -191,7 +181,6 @@ function extractFromProductPage(html, url) {
         }
     }
 
-    // 2.4) Metatags OG/Product
     for (const re of [
         /<meta[^>]+property=["']og:price:amount["'][^>]+content=["']([\d\.,]+)["']/i,
         /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([\d\.,]+)["']/i,
@@ -203,7 +192,6 @@ function extractFromProductPage(html, url) {
         }
     }
 
-    // 2.5) Fallback de texto — pega "R$ xx,xx" e ignora parcelas
     const text = innerText(html);
     const reBrl = /R\$\s*([\d\.]{1,3}(?:\.\d{3})*,\d{2})/gi;
     let pm;
@@ -215,7 +203,6 @@ function extractFromProductPage(html, url) {
         if (val) generalCandidates.push(val);
     }
 
-    // Escolha final
     let priceNum = null;
     if (saleCandidates.length) priceNum = Math.min(...saleCandidates);
     else if (generalCandidates.length) priceNum = Math.min(...generalCandidates);
@@ -224,7 +211,6 @@ function extractFromProductPage(html, url) {
     return { name, price, priceNum, url };
 }
 
-// coleta preços de offers JSON-LD; lowPrice vai para 'sale'
 function collectOfferPrices(obj, saleOut, generalOut) {
     if (!obj || typeof obj !== 'object') return;
 
@@ -246,7 +232,6 @@ function collectOfferPrices(obj, saleOut, generalOut) {
     }
 }
 
-/* ========================= Busca e resposta ========================= */
 
 function normalize(s) {
     return (s || '')
@@ -380,19 +365,3 @@ function fromNumberToBRL(v) {
     return 'R$ ' + Number(v).toFixed(2).replace('.', ',');
 }
 
-/* ========================= Dev server local (opcional) ========================= */
-if (import.meta.url === `file://${process.argv[1]}`) {
-    const http = await import('http');
-    const PORT = process.env.PORT || 3001;
-    const server = http.createServer((req, res) => {
-        const url = new URL(req.url, `http://localhost:${PORT}`);
-        if (url.pathname === '/' || url.pathname === '/api/index') {
-            return handler(req, res);
-        }
-        res.statusCode = 404;
-        res.end('Not found');
-    });
-    server.listen(PORT, () => {
-        console.log(`Dev server ON em http://localhost:${PORT} (rota /api/index)`);
-    });
-}
